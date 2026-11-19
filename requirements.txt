@@ -1,0 +1,6 @@
+streamlit>=1.50,<2
+websockets>=14
+cryptography>=42
+requests>=2.31
+plotly>=5.20
+tzdata
