@@ -291,7 +291,9 @@ class FeedService:
     def snapshot(self) -> MarketState:
         with self.lock:
             b, ix, mk = self.book, self.index, self.market
-            lad = b.ladder(5) if b.ready else {"bids": [], "asks": []}
+            empty = {"bids": [], "asks": []}
+            lad = b.ladder(5, "yes") if b.ready else empty
+            lad_no = b.ladder(5, "no") if b.ready else empty
             st = MarketState(
                 ts_ms=now_ms(), source=self.settings.source, connected=self.connected,
                 error=self.error, fee_type=self.fee_type,
@@ -303,7 +305,9 @@ class FeedService:
                 history=[h for h in ix.history if mk is None or h[0] >= mk.open_ms - 60_000],
                 book_ready=b.ready, yes_bid=b.best_yes_bid, yes_ask=b.best_yes_ask,
                 no_bid=b.best_no_bid, no_ask=b.best_no_ask,
-                bids=lad["bids"], asks=lad["asks"], last_trade=dict(self.last_trade) if self.last_trade else None,
+                bids=lad["bids"], asks=lad["asks"],
+                no_bids=lad_no["bids"], no_asks=lad_no["asks"],
+                last_trade=dict(self.last_trade) if self.last_trade else None,
                 account=self.broker.snapshot(b if b.ready else None),
             )
         return st

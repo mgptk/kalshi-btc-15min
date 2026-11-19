@@ -79,8 +79,13 @@ class OrderBook:
         """Size offered at a YES ask price (= NO bids at 1 - price)."""
         return self.no.get(ONE - yes_price, Decimal(0))
 
-    def ladder(self, depth: int = 5) -> dict:
-        """Top-of-book in YES terms: bids descending, asks ascending."""
-        bids = sorted(self.yes.items(), key=lambda kv: kv[0], reverse=True)[:depth]
-        asks = sorted(((ONE - p, q) for p, q in self.no.items()), key=lambda kv: kv[0])[:depth]
+    def ladder(self, depth: int = 5, side: str = "yes") -> dict:
+        """Top-of-book in `side`'s own prices: bids descending, asks ascending.
+
+        The book is bid-only per side, so one side's asks are the other side's bids
+        mirrored through 1 (YES ask = 1 - NO bid, and vice versa).
+        """
+        own, other = (self.yes, self.no) if side == "yes" else (self.no, self.yes)
+        bids = sorted(own.items(), key=lambda kv: kv[0], reverse=True)[:depth]
+        asks = sorted(((ONE - p, q) for p, q in other.items()), key=lambda kv: kv[0])[:depth]
         return {"bids": bids, "asks": asks}

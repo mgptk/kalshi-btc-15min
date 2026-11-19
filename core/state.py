@@ -32,11 +32,17 @@ class MarketState:
     yes_ask: Decimal | None = None
     no_bid: Decimal | None = None
     no_ask: Decimal | None = None
-    bids: list = field(default_factory=list)         # [(price, size)] best first
+    bids: list = field(default_factory=list)         # [(price, size)] best first, YES prices
     asks: list = field(default_factory=list)
+    no_bids: list = field(default_factory=list)      # same ladder in NO prices
+    no_asks: list = field(default_factory=list)
     last_trade: dict | None = None
     # paper account
     account: dict = field(default_factory=dict)
+
+    def ladder(self, side: str = "yes") -> tuple[list, list]:
+        """(bids, asks) priced in `side`'s own terms."""
+        return (self.bids, self.asks) if side == "yes" else (self.no_bids, self.no_asks)
 
     @property
     def seconds_left(self) -> float | None:

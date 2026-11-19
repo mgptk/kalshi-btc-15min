@@ -24,7 +24,10 @@ UP, DOWN, MUTED = "#16a34a", "#dc2626", "#6b7280"
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem; padding-bottom: 3rem; max-width: 560px;}
+/* Streamlit's header is fixed and overlays the page: keep it slim and transparent,
+   then start the content below it so the first row of cards isn't clipped. */
+header[data-testid="stHeader"] {height: 2.6rem; min-height: 2.6rem; background: transparent;}
+div[data-testid="stAppViewBlockContainer"], .block-container {padding-top: 3.1rem; padding-bottom: 3rem; max-width: 560px;}
 div[data-testid="stVerticalBlock"] {gap: 0.55rem;}
 .stButton > button, div[data-testid="stButton"] button {width: 100%; min-height: 2.8rem; font-weight: 600;}
 /* keep st.columns side by side on phones instead of stacking */
@@ -110,6 +113,7 @@ def live_panel() -> None:
     if a.get("maker_fees"):
         st.warning("This series currently charges maker fees — paper fills include them.")
 
+    view = (st.session_state.get("side") or "YES").lower()
     secs = s.seconds_left
     left = "—" if secs is None else f"{int(secs // 60)}:{int(secs % 60):02d}"
     gap = s.gap
@@ -121,27 +125,38 @@ def live_panel() -> None:
              vcolor=DOWN if secs is not None and secs <= 60 else None),
         card("Gap (60s avg − target)", usd(gap, sign=True), "—" if bps is None else f"{bps:+.1f} bps",
              vcolor=color(gap), cls="big"),
-        card("YES bid / ask", f"{c(s.yes_bid)} / {c(s.yes_ask)}", f"NO {c(s.no_bid)} / {c(s.no_ask)}", cls="big"),
+        card(f"{view.upper()} bid / ask",
+             f"{c(s.no_bid)} / {c(s.no_ask)}" if view == "no" else f"{c(s.yes_bid)} / {c(s.yes_ask)}",
+             f"YES {c(s.yes_bid)} / {c(s.yes_ask)}" if view == "no" else f"NO {c(s.no_bid)} / {c(s.no_ask)}",
+             cls="big"),
         card("Target", usd(s.target), s.target_source),
         card("60s avg", usd(s.avg60), f"BRTI {usd(s.brti)}"),
         card("Final avg", final, final_sub),
     ]
     st.markdown(f'<div class="hdr">{"".join(cells)}</div>', unsafe_allow_html=True)
 
-    # ladder
+    # ladder — shown in the side the ticket is set to
+    bids, asks = s.ladder(view)
     rows = []
     for i in range(5):
-        b = s.bids[i] if i < len(s.bids) else None
-        k = s.asks[i] if i < len(s.asks) else None
+        b = bids[i] if i < len(bids) else None
+        k = asks[i] if i < len(asks) else None
         rows.append(
             f'<tr><td class="bq">{q(b[1]) if b else ""}</td><td class="bp">{c(b[0]) if b else ""}</td>'
             f'<td class="ap">{c(k[0]) if k else ""}</td><td class="aq">{q(k[1]) if k else ""}</td></tr>'
         )
     lt = s.last_trade
-    last = (f'last: {q(Decimal(str(lt["count_fp"])))} @ {c(Decimal(str(lt["yes_price_dollars"])))} '
-            f'({ "YES" if (lt.get("taker_outcome_side") or lt.get("taker_side")) == "yes" else "NO"} taker)') if lt else ""
+    if lt:
+        px = Decimal(str(lt["yes_price_dollars"]))
+        if view == "no":
+            px = Decimal(1) - px
+        taker = "YES" if (lt.get("taker_outcome_side") or lt.get("taker_side")) == "yes" else "NO"
+        last = f'last: {q(Decimal(str(lt["count_fp"])))} @ {c(px)} ({taker} taker)'
+    else:
+        last = ""
     st.markdown(
-        f'<div class="card"><div class="topline"><span>YES bids</span><span>{last}</span><span>YES asks</span></div>'
+        f'<div class="card"><div class="topline"><span>{view.upper()} bids</span><span>{last}</span>'
+        f'<span>{view.upper()} asks</span></div>'
         f'<table class="lad">{"".join(rows)}</table></div>' if s.book_ready else
         '<div class="card"><div class="s">Waiting for order book…</div></div>',
         unsafe_allow_html=True,
