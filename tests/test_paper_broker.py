@@ -228,3 +228,89 @@ def test_tick_at():
     from core.market import tick_at
     assert tick_at(D("0.05")) == D("0.001") and tick_at(D("0.50")) == D("0.01")
     assert tick_at(D("0.095")) == D("0.001") and tick_at(D("0.10")) == D("0.01") and tick_at(D("0.93")) == D("0.001")
+
+
+# ---------------------------------------------------------------- take profit
+def _tp_broker():
+    br = PaperBroker(exit_mode="take_profit")
+    br.set_ticker(T)
+    b = book({0.50: 100, 0.49: 200}, {0.48: 100, 0.47: 50})   # YES 50 / 52
+    return br, b
+
+
+def test_take_profit_rests_at_avg_plus_distance_and_tracks_fills():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(30)), b, 0)
+    br.on_trade(trade(0.50, 110, "no"), b, 1)                   # 10 filled (100 ahead)
+    assert br.stop is None
+    tp = br.working("exit")[0]
+    assert tp.tag == "tp" and tp.action == "sell" and tp.price == D("0.55") and tp.qty == D(10)
+    assert tp.queue_ahead == 0                                  # 55 is above the 52 ask: nobody there
+    br.on_trade(trade(0.50, 5, "no"), b, 2)                     # 5 more -> TP grows to 15
+    tp2 = br.working("exit")[0]
+    assert tp2.qty == D(15) and tp2.price == D("0.55") and tp.status == "cancelled"
+
+
+def test_take_profit_fill_realizes_profit():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    br.on_book(b, 2)                                            # book moves don't touch the TP
+    br.on_trade(trade(0.56, 4, "yes"), b, 3)                    # taker paid through 55 -> filled
+    assert br.position is None and br.realized == D("0.50") and br.cash == D("1000.50")
+
+
+def test_take_profit_pct_and_rounding_up():
+    br, b = _tp_broker()
+    br.set_trail(D(10), "pct", b, 0)
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    assert br.working("exit")[0].price == D("0.55")             # 50 * 1.10
+    br.set_trail(D("7.5"), "pct", b, 2)                         # 53.75 -> rounds up to 54
+    assert br.working("exit")[0].price == D("0.54")
+
+
+def test_take_profit_already_past_target_stays_maker():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    delta(b, "no", 0.48, -100); delta(b, "no", 0.47, -50)       # clear asks
+    delta(b, "yes", 0.60, 20)                                    # bid jumps to 60 (> 55 target)
+    br.set_trail(D(6), "cents", b, 2)                            # target 56 <= bid 60 -> bid + 1 tick
+    assert br.working("exit")[0].price == D("0.61")
+
+
+def test_exit_now_in_take_profit_mode_cancels_tp_and_chases():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    tp = br.working("exit")[0]
+    ok, _ = br.exit_now(b, 2)
+    assert ok and br.exiting and tp.status == "cancelled"
+    ex = br.working("exit")[0]
+    assert ex.tag == "chase" and ex.price == D("0.51")
+    delta(b, "yes", 0.50, -100); br.on_book(b, 3)               # bid 49 -> chase re-prices to 50
+    assert br.working("exit")[0].price == D("0.50")
+
+
+def test_switch_modes_with_open_position():
+    br = PaperBroker()
+    br.set_ticker(T)
+    b = book({0.50: 100, 0.49: 200}, {0.48: 100, 0.47: 50})
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    assert br.stop is not None and not br.working("exit")
+    ok, msg = br.set_exit_mode("take_profit", b, 2)
+    assert ok and br.stop is None and br.working("exit")[0].price == D("0.55")
+    ok, _ = br.set_exit_mode("trailing", b, 3)
+    assert ok and not br.working("exit") and br.stop.hwm == D("0.50") and br.stop.level == D("0.45")
+    assert br.set_exit_mode("bogus", b, 4)[0] is False
+
+
+def test_take_profit_mode_has_no_stop_loss():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    delta(b, "yes", 0.50, -100); delta(b, "yes", 0.49, -200)
+    delta(b, "yes", 0.20, 10); br.on_book(b, 2)                  # bid collapses to 20
+    assert not br.exiting and br.working("exit")[0].tag == "tp"
