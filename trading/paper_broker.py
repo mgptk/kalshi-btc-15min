@@ -43,11 +43,14 @@ class PaperBroker(Broker):
         starting_cash: Decimal = STARTING_CASH,
         trail_value: Decimal = DEFAULT_TRAIL_VALUE,
         trail_mode: str = DEFAULT_TRAIL_MODE,
+        exit_mode: str = "trailing",
     ):
         self.starting_cash = Decimal(starting_cash)
         self.cash = Decimal(starting_cash)
         self.trail_value = Decimal(trail_value)
         self.trail_mode = trail_mode
+        self.exit_mode = exit_mode               # "trailing" | "take_profit"
+        self.exiting = False                     # fee-free exit chase running for the open position
         self.maker_fee_multiplier = Decimal(0)   # 0 => no maker fees (standard "quadratic" series)
         self.ticker: str | None = None
         self.price_ranges = None                 # market's price grid; None -> tapered default
@@ -141,8 +144,8 @@ class PaperBroker(Broker):
             return False, f"You hold {opp.upper()} — close it before buying {intent.side.upper()}."
         if any(o.side == opp for o in self.working("entry")):
             return False, f"Cancel your working {opp.upper()} entry first."
-        if self.stop and self.stop.state == TrailingStop.TRIGGERED:
-            return False, "Stop has triggered and the exit is working — wait for it to finish."
+        if self.exiting:
+            return False, "An exit is working on your position — wait for it to finish."
         probe = Order(0, self.ticker, intent.side, "buy", price, qty, "entry", ts_ms)
         if intent.post_only and not self._is_post_only_ok(probe, book):
             return False, (
@@ -180,21 +183,87 @@ class PaperBroker(Broker):
             return False, msg
         return True, f"Replaced #{o.id} → {msg}"
 
-    def set_trail(self, value: Decimal, mode: str) -> None:
+    def set_trail(self, value: Decimal, mode: str, book: OrderBook | None = None, ts_ms: int = 0) -> None:
         self.trail_value, self.trail_mode = Decimal(value), mode
         if self.stop and self.stop.state != TrailingStop.TRIGGERED:
             self.stop.set_trail(self.trail_value, mode)
+        if book is not None and self.exit_mode == "take_profit":
+            self._sync_tp(book, ts_ms)
+
+    def set_exit_mode(self, mode: str, book: OrderBook, ts_ms: int) -> tuple[bool, str]:
+        if mode not in ("trailing", "take_profit"):
+            return False, f"Unknown exit strategy: {mode}"
+        label = "Trailing stop" if mode == "trailing" else "Take profit"
+        if mode == self.exit_mode:
+            return True, f"Exit strategy: {label}"
+        self.exit_mode = mode
+        pos = self.position
+        note = ""
+        if pos and pos.qty > 0:
+            if self.exiting:
+                note = " (applies to your next position — an exit is already working)"
+            elif mode == "take_profit":
+                self.stop = None
+                self._sync_tp(book, ts_ms)
+                note = " — take-profit order placed for the open position"
+            else:
+                for o in self.working("exit"):
+                    self._cancel_order(o, ts_ms, "switched to trailing stop", quiet=True)
+                self.stop = TrailingStop(self.trail_value, self.trail_mode, book.best_bid(pos.side) or pos.avg_price)
+                note = " — stop now trails the open position from the current bid"
+        self._log(ts_ms, "exit mode", f"{label}{note}")
+        return True, f"Exit strategy: {label}{note}"
 
     def exit_now(self, book: OrderBook, ts_ms: int) -> tuple[bool, str]:
         if not self.position or self.position.qty <= 0:
             return False, "No open position."
-        if self.stop is None:
-            self.stop = TrailingStop(self.trail_value, self.trail_mode, book.best_bid(self.position.side))
-        if self.stop.state == TrailingStop.TRIGGERED:
+        if self.exiting:
             return False, "Exit already working."
-        self.stop.force_trigger()
+        if self.stop is not None:
+            self.stop.force_trigger()
         self._start_exit(book, ts_ms, "manual exit")
         return True, "Exit started (fee-free chase)."
+
+    # ------------------------------------------------------------------ take profit
+    def _grid_ceil(self, price: Decimal) -> Decimal:
+        step = tick_at(price, self.price_ranges)
+        return (price / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+    @property
+    def _max_price(self) -> Decimal:
+        return ONE - (self.price_ranges or DEFAULT_PRICE_RANGES)[-1][2]
+
+    def tp_target(self) -> Decimal | None:
+        """Take-profit price: average entry (incl. fees) + distance, rounded up to the price grid."""
+        pos = self.position
+        if not pos or pos.qty <= 0:
+            return None
+        avg = pos.avg_price
+        if self.trail_mode == "pct":
+            raw = avg * (ONE + self.trail_value / Decimal(100))
+        else:
+            raw = avg + self.trail_value / Decimal(100)
+        return min(self._grid_ceil(raw), self._max_price)
+
+    def _sync_tp(self, book: OrderBook, ts: int) -> None:
+        """Keep one resting post-only take-profit sell for the whole position at the target."""
+        pos = self.position
+        if not pos or pos.qty <= 0 or self.exiting or self.exit_mode != "take_profit":
+            return
+        target = self.tp_target()
+        px = target
+        bid = book.best_bid(pos.side)
+        if bid is not None and px <= bid:          # already past the target: stay maker at bid + 1 tick
+            px = min(bid + tick_at(bid, self.price_ranges), self._max_price)
+        exits = self.working("exit")
+        if exits and exits[0].tag == "tp" and exits[0].price == px and exits[0].remaining == pos.qty:
+            return
+        for o in exits:
+            self._cancel_order(o, ts, "take-profit update", quiet=True)
+        o = self._new_order(pos.side, "sell", px, pos.qty, "exit", ts, book)
+        o.tag = "tp"
+        self._log(ts, "take profit", f"#{o.id} sell {_qty(o.qty)} {o.side.upper()} @ {_cents(px)} "
+                                     f"(avg {_cents(pos.avg_price)}, queue ahead {_qty(o.queue_ahead)})")
 
     # ------------------------------------------------------------------ market events
     def set_ticker(self, ticker: str | None, price_ranges=None) -> None:
@@ -202,10 +271,13 @@ class PaperBroker(Broker):
         self.price_ranges = price_ranges
 
     def on_book(self, book: OrderBook, ts_ms: int) -> None:
-        if not self.position or self.position.qty <= 0 or self.stop is None:
+        if not self.position or self.position.qty <= 0 or self.position.ticker != book.ticker:
             return
-        if self.position.ticker != book.ticker:
+        if self.exiting:
+            self._chase(book, ts_ms)
             return
+        if self.exit_mode != "trailing" or self.stop is None:
+            return   # take-profit rests in the book; it is re-priced only on fills or setting changes
         ref = book.best_bid(self.position.side)
         if self.stop.on_reference(ref):
             self._log(
@@ -213,8 +285,6 @@ class PaperBroker(Broker):
                 f"Triggered: {self.position.side.upper()} bid {_cents(ref)} ≤ stop {_cents(self.stop.level)} (HWM {_cents(self.stop.hwm)})",
             )
             self._start_exit(book, ts_ms, "stop")
-        elif self.stop.state == TrailingStop.TRIGGERED:
-            self._chase(book, ts_ms)
 
     def on_trade(self, trade: dict, book: OrderBook, ts_ms: int) -> None:
         ticker = trade.get("market_ticker")
@@ -250,14 +320,14 @@ class PaperBroker(Broker):
                 self._cancel_order(o, ts_ms, "window closed")
         if self.position and self.position.ticker == ticker and self.position.qty > 0:
             pos = self.position
-            self.position, self.stop = None, None
+            self.position, self.stop, self.exiting = None, None, False
             if yes_won is None:
                 self.pending_settlement[ticker] = pos
                 self._log(ts_ms, "close", f"Window closed holding {_qty(pos.qty)} {pos.side.upper()} — awaiting result", ticker=ticker)
             else:
                 self._settle(ticker, pos, yes_won, ts_ms, "computed")
         elif self.position and self.position.ticker == ticker:
-            self.position, self.stop = None, None
+            self.position, self.stop, self.exiting = None, None, False
 
     def reconcile(self, ticker: str, official_yes_won: bool, ts_ms: int) -> None:
         """Apply Kalshi's official result: settle pending positions or correct a computed one."""
@@ -290,9 +360,11 @@ class PaperBroker(Broker):
                 self.position = Position(o.ticker, o.side)
             self.position.qty += qty
             self.position.cost += cost
-            if self.stop is None:
-                self.stop = TrailingStop(self.trail_value, self.trail_mode, book.best_bid(o.side) or o.price)
             self._log(ts, "fill", f"#{o.id} bought {_qty(qty)} {o.side.upper()} @ {_cents(o.price)} → position {_qty(self.position.qty)}")
+            if self.exit_mode == "take_profit":
+                self._sync_tp(book, ts)
+            elif self.stop is None:
+                self.stop = TrailingStop(self.trail_value, self.trail_mode, book.best_bid(o.side) or o.price)
         else:
             pos = self.position
             proceeds = o.price * qty - fee
@@ -305,13 +377,14 @@ class PaperBroker(Broker):
                 pos.cost -= basis
             self._log(ts, "fill", f"#{o.id} sold {_qty(qty)} {o.side.upper()} @ {_cents(o.price)}", pnl=pnl)
             if pos and pos.qty <= 0:
-                self.position, self.stop = None, None
+                self.position, self.stop, self.exiting = None, None, False
                 self._log(ts, "flat", "Position closed")
         if o.remaining <= 0:
             o.status = "filled"
             o.reserved = Decimal(0)
 
     def _start_exit(self, book: OrderBook, ts: int, reason: str) -> None:
+        self.exiting = True
         for o in self.working("entry"):
             if o.ticker == self.position.ticker:
                 self._cancel_order(o, ts, f"{reason} — cancel entry remainder")
@@ -328,11 +401,12 @@ class PaperBroker(Broker):
         target = min(bid + tick_at(bid, self.price_ranges), ONE - top[2])
         exits = self.working("exit")
         cur = exits[0] if exits else None
-        if cur and cur.price == target and cur.remaining == pos.qty:
+        if cur and cur.tag == "chase" and cur.price == target and cur.remaining == pos.qty:
             return
         for o in exits:
             self._cancel_order(o, ts, "re-price", quiet=True)
         o = self._new_order(pos.side, "sell", target, pos.qty, "exit", ts, book)
+        o.tag = "chase"
         self._log(ts, "exit", f"#{o.id} sell {_qty(o.qty)} {o.side.upper()} @ {_cents(target)} (bid {_cents(bid)}, queue ahead {_qty(o.queue_ahead)})")
 
     def _settle(self, ticker: str, pos: Position, yes_won: bool, ts: int, source: str) -> None:
@@ -377,6 +451,9 @@ class PaperBroker(Broker):
             },
             "trail_value": self.trail_value,
             "trail_mode": self.trail_mode,
+            "exit_mode": self.exit_mode,
+            "exiting": self.exiting,
+            "tp_target": self.tp_target() if self.exit_mode == "take_profit" else None,
             "orders": [vars(o).copy() for o in self.working()],
             "log": [vars(e).copy() for e in reversed(self.log[-40:])],
             "pending": list(self.pending_settlement),

@@ -42,7 +42,8 @@ The app sleeps after 12 h without visits; opening it wakes it (paper account res
 - **Ticket**: pick YES (Up) or NO (Down), price in cents, contracts. **Join bid** / **Bid + 1¢** fill the price
   from the live book. Orders are **post-only** — a price at or through the ask is rejected, so entries never pay
   taker fees. **Replace** cancels the working entry and re-places it (queue position resets).
-- **Trailing stop** (expander): distance in ¢ or %, default 5¢.
+- **Exit Strategy** (expander): choose **Trailing stop** or **Take profit** with the buttons, then set the
+  distance in ¢ or % (default 5¢). The same distance drives whichever strategy is selected.
 
 ### Paper-trading rules (summary)
 
@@ -50,10 +51,12 @@ The app sleeps after 12 h without visits; opening it wakes it (paper account res
 |---|---|
 | Bankroll | $1,000; resting buys reserve cash |
 | Fills | Conservative queue model: you're behind the size already showing at your price; only trades at your price advance the queue; a trade through your price fills you fully; cancellations don't help you |
-| Stop | Created on first fill, covers the whole position and grows with fills. Tracks the high of your side's best bid; stop = high − trail |
+| Exit strategy | Trailing stop (default) or Take profit, chosen in the Exit Strategy section. Switching with a position open applies to it immediately (unless an exit is already working) |
+| Trailing stop | Created on first fill, covers the whole position and grows with fills. Tracks the high of your side's best bid; stop = high − trail |
+| Take profit | Rests a post-only sell for the whole position at average entry + distance (¢, or % of the average), rounded up to the price grid. Re-placed when fills are added or the distance changes. If the bid is already past the target it posts at bid + 1 tick. No stop loss in this mode |
 | Stop off | While your side's bid is ≥ 90¢ (re-arms below 90¢) |
 | On trigger | Cancels any unfilled entry, then posts a fee-free sell at best bid + 1 tick and re-posts every time the bid moves, until filled or the window closes |
-| Exit now | Starts the same fee-free chase immediately |
+| Exit now | Starts the fee-free chase immediately (either strategy; cancels a resting take-profit) |
 | Close | Working orders cancelled; open position settles $1/$0 from the final-minute average vs target, then reconciled with Kalshi's official result |
 | Fees | Checked from the series `fee_type` at startup (currently `quadratic` = makers pay nothing) |
 | One side at a time | Can't buy NO while holding YES (or vice-versa) |

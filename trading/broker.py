@@ -25,7 +25,12 @@ class Broker(ABC):
     def replace(self, order_id: int, price: Decimal, qty: Decimal, book: OrderBook, ts_ms: int) -> tuple[bool, str]: ...
 
     @abstractmethod
-    def set_trail(self, value: Decimal, mode: str) -> None: ...
+    def set_trail(self, value: Decimal, mode: str, book: OrderBook | None = None, ts_ms: int = 0) -> None:
+        """Set the exit distance (used by the trailing stop and the take-profit)."""
+
+    @abstractmethod
+    def set_exit_mode(self, mode: str, book: OrderBook, ts_ms: int) -> tuple[bool, str]:
+        """Choose the exit strategy: "trailing" or "take_profit"."""
 
     @abstractmethod
     def exit_now(self, book: OrderBook, ts_ms: int) -> tuple[bool, str]: ...

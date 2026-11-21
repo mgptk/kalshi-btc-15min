@@ -37,6 +37,7 @@ class Order:
     queue_ahead: Decimal = Decimal(0)
     status: str = "working"           # working | filled | cancelled
     reserved: Decimal = Decimal(0)    # cash held for a resting buy
+    tag: str = ""                     # exits: "tp" (take-profit) or "chase" (fee-free exit chase)
 
     @property
     def remaining(self) -> Decimal:

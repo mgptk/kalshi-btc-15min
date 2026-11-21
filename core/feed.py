@@ -327,7 +327,11 @@ class FeedService:
 
     def set_trail(self, value: Decimal, mode: str) -> None:
         with self.lock:
-            self.broker.set_trail(Decimal(value), mode)
+            self.broker.set_trail(Decimal(value), mode, self.book, now_ms())
+
+    def set_exit_mode(self, mode: str) -> tuple[bool, str]:
+        with self.lock:
+            return self.broker.set_exit_mode(mode, self.book, now_ms())
 
     def exit_now(self) -> tuple[bool, str]:
         with self.lock:

@@ -162,27 +162,37 @@ def live_panel() -> None:
         unsafe_allow_html=True,
     )
 
-    # position + stop
+    # position + exit strategy
     pos, stop = a["position"], a["stop"]
     if pos:
         unreal = a["unrealized"]
-        chip_bg = {"armed": UP, "off": "#f59e0b", "triggered": DOWN}.get(stop["state"] if stop else "", MUTED)
-        trail = (f'{q(stop["trail_value"])}{"¢" if stop["trail_mode"] == "cents" else "%"}') if stop else ""
+        dist = f'{q(a["trail_value"])}{"¢" if a["trail_mode"] == "cents" else "%"}'
+        if a["exiting"]:
+            exit_line = (f'<span class="chip" style="background:{DOWN};color:white">EXITING</span> '
+                         f'&nbsp;fee-free chase at bid + 1 tick')
+        elif a["exit_mode"] == "take_profit":
+            exit_line = (f'<span class="chip" style="background:#2563eb;color:white">TAKE PROFIT</span> '
+                         f'&nbsp;target {c(a["tp_target"])} · avg + {dist}')
+        elif stop:
+            chip_bg = {"armed": UP, "off": "#f59e0b", "triggered": DOWN}.get(stop["state"], MUTED)
+            exit_line = (f'<span class="chip" style="background:{chip_bg};color:white">STOP {stop["state"].upper()}</span> '
+                         f'&nbsp;HWM {c(stop["hwm"])} · stop {c(stop["level"])} · trail {dist}')
+        else:
+            exit_line = ""
         st.markdown(
             f'<div class="card pos"><div class="topline"><span><b>{pos["side"].upper()}</b> '
             f'{q(pos["qty"])} @ {c(pos["avg"])}</span>'
             f'<span>uPnL <b style="color:{color(unreal)}">{usd(unreal, sign=True)}</b></span></div>'
-            + (f'<span class="chip" style="background:{chip_bg};color:white">STOP {stop["state"].upper()}</span> '
-               f'&nbsp;HWM {c(stop["hwm"])} · stop {c(stop["level"])} · trail {trail}' if stop else "")
-            + '</div>',
+            + exit_line + '</div>',
             unsafe_allow_html=True,
         )
-        if not stop or stop["state"] != "triggered":
+        if not a["exiting"]:
             if st.button("Exit now (fee-free chase)", key="exit_now", width="stretch"):
                 flash(*feed.exit_now())
 
     for o in a["orders"]:
-        label = (f'{"EXIT" if o["purpose"] == "exit" else "ENTRY"} #{o["id"]}: {o["action"]} '
+        kind = "ENTRY" if o["purpose"] == "entry" else ("TAKE PROFIT" if o.get("tag") == "tp" else "EXIT")
+        label = (f'{kind} #{o["id"]}: {o["action"]} '
                  f'{q(o["qty"])} {o["side"].upper()} @ {c(o["price"])} · filled {q(o["filled"])} · '
                  f'queue ahead {q(o["queue_ahead"])}')
         if o["purpose"] == "entry":
@@ -240,24 +250,46 @@ def ticket() -> None:
             flash(False, "No working entry to replace.")
 
 
-# ---------------------------------------------------------------- trailing-stop setting
+# ---------------------------------------------------------------- exit strategy
+EXIT_MODES = {"trailing": "Trailing stop", "take_profit": "Take profit"}
+
+
 def _apply_trail() -> None:
     mode = "cents" if st.session_state["trail_mode"] == "¢" else "pct"
     feed.set_trail(Decimal(str(st.session_state["trail_val"])), mode)
 
 
+def _set_exit_mode(mode: str) -> None:
+    st.session_state["exit_flash"] = feed.set_exit_mode(mode)
+
+
 @st.fragment
-def trail_control() -> None:
+def exit_control() -> None:
     a = feed.snapshot().account
+    current = a["exit_mode"]
+    b1, b2 = st.columns(2)
+    for col, (mode, label) in zip((b1, b2), EXIT_MODES.items()):
+        col.button(label, key=f"exit_mode_{mode}", width="stretch",
+                   type="primary" if mode == current else "secondary",
+                   on_click=_set_exit_mode, args=(mode,))
+    if "exit_flash" in st.session_state:
+        flash(*st.session_state.pop("exit_flash"))
+
     st.session_state.setdefault("trail_val", float(a["trail_value"]))
     st.session_state.setdefault("trail_mode", "¢" if a["trail_mode"] == "cents" else "%")
     c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
     pct = st.session_state["trail_mode"] == "%"
-    c1.number_input("Trailing stop distance", min_value=0.5, max_value=99.0 if pct else 98.0,
+    label = "Trailing stop distance" if current == "trailing" else "Take-profit distance"
+    c1.number_input(label, min_value=0.5, max_value=99.0 if pct else 98.0,
                     step=0.5 if pct else 1.0, format="%.1f", key="trail_val", on_change=_apply_trail)
     c2.segmented_control("Unit", ["¢", "%"], key="trail_mode", on_change=_apply_trail,
                          label_visibility="collapsed", width="stretch")
-    st.caption("Applies to new positions and live to an untriggered stop. Off while bid ≥ 90¢.")
+    if current == "trailing":
+        st.caption("Stop trails the high of your side's bid. Applies to new positions and live to an "
+                   "untriggered stop. Off while bid ≥ 90¢.")
+    else:
+        st.caption("Rests a fee-free sell for the whole position at your average entry + distance. "
+                   "Updates as you add fills or change the distance. No stop loss in this mode.")
 
 
 # ---------------------------------------------------------------- chart
@@ -311,8 +343,8 @@ def activity() -> None:
 # ---------------------------------------------------------------- layout
 live_panel()
 ticket()
-with st.expander("Trailing stop", expanded=False):
-    trail_control()
+with st.expander("Exit Strategy", expanded=False):
+    exit_control()
 chart()
 with st.expander("Activity & account", expanded=False):
     activity()
