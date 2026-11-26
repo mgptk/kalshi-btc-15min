@@ -52,6 +52,8 @@ class FeedService:
         self._rest: KalshiRest | None = None
         self._sim = None
         self._tasks: set[asyncio.Task] = set()
+        self._polling: set[str] = set()     # tickers whose official result is being polled
+        self.persister = None                # core.persist.Persister, attached by the app
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> "FeedService":
@@ -167,6 +169,9 @@ class FeedService:
             self.market = mkt
             self.target_source = src
             self.broker.set_ticker(mkt.ticker, mkt.price_ranges)
+            unresolved = self.broker.unresolved_tickers()
+        for t in unresolved:            # e.g. windows that closed while the app was down
+            self._poll(t)
         await self._subscribe_market(mkt.ticker)
         self._notify("market")
 
@@ -191,7 +196,12 @@ class FeedService:
             yes_won = final[0] >= mkt.target
         with self.lock:
             self.broker.on_window_close(mkt.ticker, yes_won, now_ms())
-        self._spawn(self._poll_result(mkt.ticker))
+        self._poll(mkt.ticker)
+
+    def _poll(self, ticker: str) -> None:
+        if ticker not in self._polling:
+            self._polling.add(ticker)
+            self._spawn(self._poll_result(ticker))
 
     def _spawn(self, coro) -> None:
         t = asyncio.get_running_loop().create_task(coro)
@@ -209,6 +219,12 @@ class FeedService:
             pass
 
     async def _poll_result(self, ticker: str) -> None:
+        try:
+            await self._poll_result_inner(ticker)
+        finally:
+            self._polling.discard(ticker)
+
+    async def _poll_result_inner(self, ticker: str) -> None:
         waited = 0
         while waited < RESULT_POLL_MAX_S:
             await asyncio.sleep(RESULT_POLL_S if self._sim is None else 2)
@@ -340,3 +356,14 @@ class FeedService:
     def exit_now(self) -> tuple[bool, str]:
         with self.lock:
             return self.broker.exit_now(self.book, now_ms())
+
+    def reset_account(self) -> tuple[bool, str]:
+        with self.lock:
+            return self.broker.reset_account(now_ms())
+
+    def performance(self) -> dict:
+        """All-time P&L history plus where it's being saved."""
+        with self.lock:
+            perf = self.broker.performance()
+        perf["persist"] = self.persister.status() if self.persister else None
+        return perf

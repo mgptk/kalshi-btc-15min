@@ -14,6 +14,7 @@ import streamlit as st
 
 from core.config import DISPLAY_TZ, load_settings
 from core.feed import FeedService
+from core.persist import Persister, make_store
 from trading.paper_broker import PaperBroker
 
 st.set_page_config(page_title="BTC 15m Terminal", page_icon="📈", layout="centered",
@@ -58,8 +59,18 @@ table.lad tr:first-child td {border-bottom: 1px solid rgba(127,127,127,.25);}
 
 @st.cache_resource(show_spinner="Connecting to market data…")
 def get_feed() -> FeedService:
-    """One FeedService per server process, shared by every tab/session."""
-    return FeedService(load_settings(), PaperBroker()).start()
+    """One FeedService per server process, shared by every tab/session.
+
+    The saved paper account is loaded before the feed starts, then saved whenever it changes.
+    """
+    settings = load_settings()
+    feed = FeedService(settings, PaperBroker())
+    store = make_store(settings)
+    if store is not None:
+        feed.persister = Persister(feed.broker, store, feed.lock)
+        feed.persister.load()
+        feed.persister.start()
+    return feed.start()
 
 
 feed = get_feed()
@@ -332,6 +343,86 @@ def chart() -> None:
     st.plotly_chart(fig, config={"staticPlot": True}, key="chart")
 
 
+# ---------------------------------------------------------------- performance (all-time, persisted)
+def _ago(ms: int | None) -> str:
+    if not ms:
+        return "not yet"
+    secs = max(0, int(datetime.now().timestamp() - ms / 1000))
+    return f"{secs}s ago" if secs < 90 else f"{secs // 60}m ago" if secs < 5400 else f"{secs // 3600}h ago"
+
+
+@st.fragment(run_every=5)
+def performance() -> None:
+    p = feed.performance()
+    a = feed.snapshot().account
+    ps = p["persist"]
+    if ps is None:
+        st.caption("History isn't being saved (PAPER_PERSIST is off) — it resets when the app restarts.")
+    elif ps["error"]:
+        st.warning(f"Saving to {ps['backend']}: {ps['error']}")
+    else:
+        note = ""
+        if ps["kind"] == "file":
+            note = " · wiped on Streamlit Cloud restarts unless PAPER_GIST_ID + GITHUB_TOKEN are set"
+        if ps["last_save_ms"]:
+            when = f"last save {_ago(ps['last_save_ms'])}"
+        else:
+            when = "restored at startup, up to date" if ps["restored"] else "nothing to save yet"
+        st.caption(f"Saved to {ps['backend']} · {when}{note}")
+
+    ledger = p["ledger"]
+    events = [e for e in ledger if e["event"] != "correction"]
+    pnls = [Decimal(e["pnl"]) for e in events]
+    wins = sum(1 for x in pnls if x > 0)
+    today = datetime.now(TZ).date()
+    today_pnl = sum((Decimal(e["pnl"]) for e in ledger
+                     if datetime.fromtimestamp(e["ts"] / 1000, TZ).date() == today), Decimal(0))
+    since = "—"
+    if p["tracking_since_ms"]:
+        d0 = datetime.fromtimestamp(p["tracking_since_ms"] / 1000, TZ)
+        since = f"{d0:%b} {d0.day}"     # portable (no %-d on Windows)
+    cells = [
+        card("All-time P&L", usd(a["all_time_pnl"], sign=True), f"vs {usd(p['starting_cash'], 0)} start",
+             vcolor=color(a["all_time_pnl"]), cls="big"),
+        card("Realized", usd(p["realized"], sign=True), f"since {since}", vcolor=color(p["realized"])),
+        card("Today", usd(today_pnl, sign=True), "realized", vcolor=color(today_pnl)),
+        card("Closed trades", str(len(events)), "exits + settlements"),
+        card("Win rate", f"{100 * wins / len(events):.0f}%" if events else "—", f"{wins} won"),
+        card("Avg / trade", usd(sum(pnls, Decimal(0)) / len(pnls), sign=True) if pnls else "—",
+             f"best {usd(max(pnls), sign=True)}" if pnls else ""),
+    ]
+    st.markdown(f'<div class="hdr">{"".join(cells)}</div>', unsafe_allow_html=True)
+
+    if len(ledger) >= 2:
+        # ledger may be capped: start the curve at whatever realized P&L came before its first entry
+        base = p["realized"] - sum((Decimal(e["pnl"]) for e in ledger), Decimal(0))
+        xs, ys, cum = [], [], base
+        for e in ledger:
+            cum += Decimal(e["pnl"])
+            xs.append(datetime.fromtimestamp(e["ts"] / 1000, TZ))
+            ys.append(float(cum))
+        fig = go.Figure()
+        fig.add_hline(y=0, line=dict(color="rgba(127,127,127,.45)", width=1))
+        fig.add_scatter(x=xs, y=ys, mode="lines", line=dict(width=2, color="#2563eb", shape="hv"),
+                        customdata=[f'{e["event"]} {e["ticker"]}' for e in ledger],
+                        hovertemplate="%{x|%b %-d %H:%M}<br><b>%{y:$,.2f}</b><br>%{customdata}<extra></extra>")
+        fig.update_layout(height=210, margin=dict(l=0, r=0, t=34, b=0), showlegend=False,
+                          title=dict(text="Cumulative realized P&L", font=dict(size=12), x=0, y=0.98),
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          yaxis=dict(tickformat="$,.2f", gridcolor="rgba(127,127,127,.15)",
+                                     zeroline=False),
+                          xaxis=dict(gridcolor="rgba(127,127,127,.1)"))
+        st.plotly_chart(fig, config={"displayModeBar": False}, key="perf_chart")
+    elif not ledger:
+        st.caption("No closed trades yet — the P&L curve starts with your first exit or settlement.")
+
+    with st.popover("Reset paper account", width="stretch"):
+        st.caption(f"Clears the saved history and puts cash back to {usd(p['starting_cash'], 0)}. "
+                   "Can't be undone.")
+        if st.button("Yes, reset everything", key="reset_acct", type="primary", width="stretch"):
+            flash(*feed.reset_account())
+
+
 # ---------------------------------------------------------------- activity log
 @st.fragment(run_every=2)
 def activity() -> None:
@@ -357,5 +448,7 @@ ticket()
 with st.expander("Exit Strategy", expanded=False):
     exit_control()
 chart()
+with st.expander("Performance", expanded=False):
+    performance()
 with st.expander("Activity & account", expanded=False):
     activity()

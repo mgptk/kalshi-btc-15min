@@ -15,7 +15,7 @@ from core.config import (
     STARTING_CASH,
     TICK,
 )
-from core.market import tick_at
+from core.market import now_ms, tick_at
 from core.orderbook import OrderBook
 
 from .broker import Broker
@@ -24,6 +24,8 @@ from .trailing_stop import TrailingStop
 
 MIN_PRICE = TICK
 MAX_PRICE = ONE - TICK
+STATE_VERSION = 1
+LEDGER_MAX = 5000                # realized-P&L events kept for the performance history
 MAKER_RATE = Decimal("0.0175")
 TAKER_RATE = Decimal("0.07")
 CENT = Decimal("0.01")
@@ -69,12 +71,24 @@ class PaperBroker(Broker):
         # settlement bookkeeping, keyed by ticker
         self.pending_settlement: dict[str, Position] = {}
         self.settled: dict[str, dict] = {}
+        # performance history: one entry per realized-P&L event (sells, settlements, corrections)
+        self.ledger: list[dict] = []
+        self.tracking_since_ms: int | None = None
+        self.boot_equity = self.starting_cash     # equity when this run started (for session P&L)
+        self._restore_exit = False                 # re-attach the exit to a restored position
 
     # ------------------------------------------------------------------ helpers
     def _log(self, ts: int, event: str, detail: str = "", pnl: Decimal | None = None, ticker: str | None = None):
         self.log.append(LogEntry(ts, ticker or self.ticker or "", event, detail, pnl))
         if len(self.log) > 500:
             del self.log[:100]
+        if pnl is not None:
+            if self.tracking_since_ms is None:
+                self.tracking_since_ms = ts
+            self.ledger.append({"ts": ts, "ticker": ticker or self.ticker or "", "event": event,
+                                "pnl": str(pnl.quantize(Decimal("0.000001"))), "detail": detail})
+            if len(self.ledger) > LEDGER_MAX:
+                del self.ledger[: len(self.ledger) - LEDGER_MAX]
 
     def set_fee_model(self, fee_type: str | None, multiplier: float | None) -> None:
         if fee_type and "maker" in fee_type:
@@ -372,10 +386,36 @@ class PaperBroker(Broker):
     def set_ticker(self, ticker: str | None, price_ranges=None) -> None:
         self.ticker = ticker
         self.price_ranges = price_ranges
+        self._park_stale_position(now_ms())
+
+    def _park_stale_position(self, ts: int) -> None:
+        """A restored position from a window that has since closed waits for the official result."""
+        pos = self.position
+        if pos is None or self.ticker is None or pos.ticker == self.ticker:
+            return
+        if pos.qty > 0:
+            self.pending_settlement[pos.ticker] = pos
+            self._log(ts, "close", f"Window closed while the app was down, holding {_qty(pos.qty)} "
+                                   f"{pos.side.upper()} — awaiting result", ticker=pos.ticker)
+        self._go_flat()
+        self._restore_exit = False
+
+    def unresolved_tickers(self) -> list[str]:
+        """Closed windows still waiting for (or not yet checked against) Kalshi's official result."""
+        return list(self.pending_settlement) + [t for t, r in self.settled.items() if r["source"] == "computed"]
 
     def on_book(self, book: OrderBook, ts_ms: int) -> None:
         if not self.position or self.position.qty <= 0 or self.position.ticker != book.ticker:
             return
+        if self._restore_exit:
+            self._restore_exit = False
+            if not self.exiting:
+                if self.exit_mode == "take_profit":
+                    self._sync_tp(book, ts_ms)
+                elif self.stop is None:
+                    self.stop = TrailingStop(self.trail_value, self.trail_mode,
+                                             book.best_bid(self.position.side) or self.position.avg_price)
+                    self._log(ts_ms, "restore", "Trailing stop re-attached from the current bid after restart")
         if self.exiting:
             self._chase(book, ts_ms)
             return
@@ -443,7 +483,8 @@ class PaperBroker(Broker):
         if rec["yes_won"] != official_yes_won:
             self.cash -= rec["payout"]
             self.realized -= rec["pnl"]
-            self._log(ts_ms, "correction", "Computed result disagreed with Kalshi's official result — re-settling", ticker=ticker)
+            self._log(ts_ms, "correction", "Computed result disagreed with Kalshi's official result — re-settling",
+                      pnl=-rec["pnl"], ticker=ticker)
             self._settle(ticker, rec["position"], official_yes_won, ts_ms, "official")
         else:
             rec["source"] = "official"
@@ -541,6 +582,100 @@ class PaperBroker(Broker):
             pnl=pnl, ticker=ticker,
         )
 
+    # ------------------------------------------------------------------ persistence
+    def is_fresh(self) -> bool:
+        """Nothing has happened in this run yet (safe to apply a late-loaded saved state)."""
+        return (not self.fills and not self.orders and not self.ledger and self.position is None
+                and self.cash == self.starting_cash)
+
+    @staticmethod
+    def _pos_state(p: Position) -> dict:
+        return {"ticker": p.ticker, "side": p.side, "qty": str(p.qty), "cost": str(p.cost)}
+
+    @staticmethod
+    def _pos_load(d: dict) -> Position:
+        return Position(d["ticker"], d["side"], Decimal(d["qty"]), Decimal(d["cost"]))
+
+    def to_state(self) -> dict:
+        """Everything needed to carry the account across a restart. Working orders are not kept."""
+        computed = [(t, r) for t, r in self.settled.items() if r["source"] == "computed"][-20:]
+        return {
+            "version": STATE_VERSION,
+            "starting_cash": str(self.starting_cash),
+            "cash": str(self.cash),
+            "realized": str(self.realized),
+            "tracking_since_ms": self.tracking_since_ms,
+            "next_id": self._next_id,
+            "trail_value": str(self.trail_value),
+            "trail_mode": self.trail_mode,
+            "exit_mode": self.exit_mode,
+            "position": self._pos_state(self.position) if self.position and self.position.qty > 0 else None,
+            "protected": self.protected,
+            "exiting": self.exiting,
+            "pending": {t: self._pos_state(p) for t, p in self.pending_settlement.items()},
+            "unreconciled": {
+                t: {"position": self._pos_state(r["position"]), "yes_won": r["yes_won"],
+                    "payout": str(r["payout"]), "pnl": str(r["pnl"])}
+                for t, r in computed
+            },
+            "ledger": self.ledger,
+        }
+
+    def load_state(self, st: dict) -> None:
+        if st.get("version") != STATE_VERSION:
+            raise ValueError(f"unsupported state version {st.get('version')!r}")
+        self.starting_cash = Decimal(st["starting_cash"])
+        self.cash = Decimal(st["cash"])
+        self.realized = Decimal(st["realized"])
+        self.tracking_since_ms = st.get("tracking_since_ms")
+        self._next_id = max(self._next_id, int(st.get("next_id", 1)))
+        self.trail_value = Decimal(st.get("trail_value", str(self.trail_value)))
+        self.trail_mode = st.get("trail_mode", self.trail_mode)
+        self.exit_mode = st.get("exit_mode", self.exit_mode)
+        self.orders, self.stop = {}, None
+        self.position = self._pos_load(st["position"]) if st.get("position") else None
+        self.protected = bool(st.get("protected")) and self.position is not None
+        self.exiting = bool(st.get("exiting")) and self.position is not None
+        self._restore_exit = self.protected or self.exiting
+        self.pending_settlement = {t: self._pos_load(p) for t, p in (st.get("pending") or {}).items()}
+        self.settled = {
+            t: {"position": self._pos_load(r["position"]), "yes_won": r["yes_won"],
+                "payout": Decimal(r["payout"]), "pnl": Decimal(r["pnl"]), "source": "computed"}
+            for t, r in (st.get("unreconciled") or {}).items()
+        }
+        self.ledger = list(st.get("ledger") or [])
+        self.boot_equity = self.cash + (self.position.cost if self.position else Decimal(0))
+        pend = f", {len(self.pending_settlement)} awaiting result" if self.pending_settlement else ""
+        held = f", holding {_qty(self.position.qty)} {self.position.side.upper()}" if self.position else ""
+        ts = now_ms()
+        self._log(ts, "restore", f"Account restored: cash ${self.cash:.2f}, all-time realized "
+                                f"{'+' if self.realized >= 0 else '−'}${abs(self.realized):.2f}{held}{pend}")
+        self._park_stale_position(ts)
+
+    def reset_account(self, ts_ms: int) -> tuple[bool, str]:
+        """Start the paper account over: bankroll back to the start, history cleared."""
+        if self.position and self.position.qty > 0:
+            return False, "Close your position before resetting."
+        for o in self.working():
+            self._cancel_order(o, ts_ms, "account reset", quiet=True)
+        self.realized = Decimal(0)
+        self.cash = self.starting_cash
+        self.boot_equity = self.starting_cash
+        self.pending_settlement, self.settled = {}, {}
+        self.ledger, self.tracking_since_ms = [], None
+        self.fills.clear()
+        self._go_flat()
+        self._log(ts_ms, "reset", f"Paper account reset to ${self.starting_cash:.2f}")
+        return True, f"Account reset to ${self.starting_cash:.2f}"
+
+    def performance(self) -> dict:
+        return {
+            "ledger": [dict(e) for e in self.ledger],
+            "realized": self.realized,
+            "starting_cash": self.starting_cash,
+            "tracking_since_ms": self.tracking_since_ms,
+        }
+
     # ------------------------------------------------------------------ reporting
     def snapshot(self, book: OrderBook | None) -> dict:
         pos = self.position
@@ -559,7 +694,8 @@ class PaperBroker(Broker):
             "realized": self.realized,
             "unrealized": unreal,
             "equity": equity,
-            "session_pnl": equity - self.starting_cash,
+            "session_pnl": equity - self.boot_equity,
+            "all_time_pnl": equity - self.starting_cash,
             "position": None if not pos else {
                 "ticker": pos.ticker, "side": pos.side, "qty": pos.qty,
                 "avg": pos.avg_price, "cost": pos.cost, "mark": mark,

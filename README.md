@@ -32,7 +32,26 @@ With credentials present the app uses live Kalshi data; without them it falls ba
 4. After deploy, open app **Settings → Sharing** and make it **private** (only invited emails can view) —
    the free tier allows one private app, and the order buttons shouldn't be public.
 
-The app sleeps after 12 h without visits; opening it wakes it (paper account resets on restart).
+The app sleeps after 12 h without visits; opening it wakes it. Its disk is wiped on every sleep, reboot
+and redeploy, so to keep your paper P&L history set up a Gist (next section).
+
+### Keeping P&L history across restarts
+
+The paper account (cash, realized P&L, the closed-trade history, the open position and any windows
+awaiting settlement) is saved every few seconds when it changes, and loaded when the app starts.
+
+- **Locally** it's saved to `data/paper_state_live.json` (or `_sim.json`), which is gitignored. Nothing to set up.
+- **On Streamlit Cloud** use a private GitHub Gist:
+  1. Go to gist.github.com, create a **secret** gist with any file in it (e.g. `readme.txt` containing `paper`),
+     and copy the id at the end of its URL.
+  2. Create a token at GitHub → Settings → Developer settings → **Fine-grained tokens** with
+     **Account permissions → Gists: Read and write** (or a classic token with the `gist` scope).
+  3. Add `PAPER_GIST_ID` and `GITHUB_TOKEN` to the app's Secrets and reboot it. The **Performance** section shows
+     where it's saving and the time of the last save.
+
+Live and sim accounts are kept in separate files. If the saved history can't be loaded at startup (network
+down, bad token), the app shows a warning and **doesn't save** during that run, so it never overwrites your history
+with a fresh account.
 
 ## Using the terminal
 
@@ -45,6 +64,10 @@ The app sleeps after 12 h without visits; opening it wakes it (paper account res
 - **Ticket**: pick YES (Up) or NO (Down), price in cents, contracts. **Join bid** / **Bid + 1¢** fill the price
   from the live book. Orders are **post-only** — a price at or through the ask is rejected, so entries never pay
   taker fees. **Replace** cancels the working entry and re-places it (queue position resets).
+- **Performance** (expander): all-time P&L (equity vs the $1,000 start), realized P&L, today's realized P&L,
+  closed trades, win rate, average per trade, and a cumulative realized-P&L curve. Shows where the history is
+  saved. **Reset paper account** clears the history and restores the $1,000 bankroll (only while flat).
+  The header's **Session** figure is P&L since the app last started.
 - **Exit Strategy** (expander): choose **Trailing stop** or **Take profit** with the buttons, then set the
   distance in ¢ or % (default 5¢). The same distance drives whichever strategy is selected. With a position that
   has no exit (e.g. from a market buy), tapping either strategy — including the one already highlighted — attaches it.
@@ -63,6 +86,7 @@ The app sleeps after 12 h without visits; opening it wakes it (paper account res
 | Exit now | Starts the fee-free chase immediately (either strategy; cancels a resting take-profit) |
 | Close | Working orders cancelled; open position settles $1/$0 from the final-minute average vs target, then reconciled with Kalshi's official result |
 | Market orders | Walk the book level by level at resting prices for the full quantity; any part the book can't fill is cancelled. Buys need enough buying power for the whole fill; sells can't exceed what you hold. A market buy into a flat position has no stop/TP; into a position that already has one, that exit keeps covering the whole position (a take-profit is resized). A market sell resizes a working take-profit/chase, or cancels it if you go flat |
+| Restarts | Cash, realized P&L, history and the open position carry over; working orders are dropped. A stop/take-profit on the open position is re-attached on the first book update (the stop's high-water mark restarts from the current bid). A position whose window closed while the app was down settles from Kalshi's official result |
 | Fees | Checked from the series `fee_type` at startup (currently `quadratic` = makers pay nothing). Market orders pay the taker fee: 7% × fee multiplier × contracts × P × (1 − P), rounded up to the cent per price level |
 | One side at a time | Can't buy NO while holding YES (or vice-versa) |
 
@@ -82,6 +106,7 @@ core/
   auth.py               RSA-PSS request signing
   sim.py                offline simulator speaking Kalshi's message shapes
   state.py              MarketState snapshot (what the UI and the future bot read)
+  persist.py            saves/loads the paper account (local file or GitHub Gist)
 trading/
   broker.py             Broker interface (PaperBroker now, KalshiBroker later)
   paper_broker.py       orders, queue fills, exits, settlement, P&L

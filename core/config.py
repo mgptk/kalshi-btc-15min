@@ -38,6 +38,11 @@ class Settings:
     private_key_pem: str | None
     rest_base: str = PROD_REST
     ws_url: str = PROD_WS
+    # paper-account persistence (see core/persist.py)
+    persist: str | None = None          # "off" disables it
+    state_path: str | None = None       # local JSON file (default data/paper_state_<source>.json)
+    gist_id: str | None = None          # private GitHub Gist id — survives Streamlit Cloud restarts
+    github_token: str | None = None     # token with the "gist" scope
 
 
 def _get(name: str) -> str | None:
@@ -63,4 +68,8 @@ def load_settings() -> Settings:
     source = (_get("FEED_SOURCE") or "").lower()
     if source not in ("kalshi", "sim"):
         source = "kalshi" if (key_id and pem) else "sim"
-    return Settings(source=source, api_key_id=key_id, private_key_pem=pem)
+    return Settings(
+        source=source, api_key_id=key_id, private_key_pem=pem,
+        persist=_get("PAPER_PERSIST"), state_path=_get("PAPER_STATE_PATH"),
+        gist_id=_get("PAPER_GIST_ID"), github_token=_get("GITHUB_TOKEN"),
+    )
