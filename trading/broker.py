@@ -19,6 +19,10 @@ class Broker(ABC):
         """Accept or reject an intent. Returns (ok, message)."""
 
     @abstractmethod
+    def market_order(self, side: str, action: str, qty: Decimal, book: OrderBook, ts_ms: int) -> tuple[bool, str]:
+        """Buy or sell `qty` contracts of `side` immediately against the book (taker fees apply)."""
+
+    @abstractmethod
     def cancel(self, order_id: int, ts_ms: int) -> tuple[bool, str]: ...
 
     @abstractmethod

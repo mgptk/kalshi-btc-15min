@@ -49,6 +49,9 @@ table.lad td.ap {text-align:left; color:#dc2626; font-weight:700;} table.lad td.
 table.lad tr:first-child td {border-bottom: 1px solid rgba(127,127,127,.25);}
 .chip {display:inline-block; padding:1px 8px; border-radius:999px; font-size:0.75rem; font-weight:700;}
 .pos {font-variant-numeric: tabular-nums;}
+.st-key-mkt_buy button {background:#16a34a; border-color:#16a34a; color:white;}
+.st-key-mkt_sell button {background:#dc2626; border-color:#dc2626; color:white;}
+.st-key-mkt_buy button:hover, .st-key-mkt_sell button:hover {filter:brightness(1.1); color:white;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -170,6 +173,9 @@ def live_panel() -> None:
         if a["exiting"]:
             exit_line = (f'<span class="chip" style="background:{DOWN};color:white">EXITING</span> '
                          f'&nbsp;fee-free chase at bid + 1 tick')
+        elif not a["protected"]:
+            exit_line = (f'<span class="chip" style="background:{MUTED};color:white">NO STOP / TP</span> '
+                         f'&nbsp;add one in Exit Strategy')
         elif a["exit_mode"] == "take_profit":
             exit_line = (f'<span class="chip" style="background:#2563eb;color:white">TAKE PROFIT</span> '
                          f'&nbsp;target {c(a["tp_target"])} · avg + {dist}')
@@ -230,15 +236,20 @@ def ticket() -> None:
     st.session_state.setdefault("qty", 10)
     st.segmented_control("Side", ["YES", "NO"], key="side", default="YES", label_visibility="collapsed",
                          width="stretch")
+    side = (st.session_state.get("side") or "YES").lower()
+    qty = Decimal(st.session_state["qty"])
+    m1, m2 = st.columns(2)
+    if m1.button(f"Market buy {qty} {side.upper()}", key="mkt_buy", width="stretch"):
+        flash(*feed.market_order(side, "buy", qty))
+    if m2.button(f"Market sell {qty} {side.upper()}", key="mkt_sell", width="stretch"):
+        flash(*feed.market_order(side, "sell", qty))
     c1, c2 = st.columns(2)
     c1.number_input("Price (¢)", min_value=1, max_value=99, step=1, key="px")
     c2.number_input("Contracts", min_value=1, max_value=100_000, step=1, key="qty")
     b1, b2 = st.columns(2)
     b1.button("Join bid", on_click=_set_px, args=("bid",), key="join", width="stretch")
     b2.button("Bid + 1¢", on_click=_set_px, args=("improve",), key="improve", width="stretch")
-    side = (st.session_state.get("side") or "YES").lower()
     px = Decimal(st.session_state["px"]) / 100
-    qty = Decimal(st.session_state["qty"])
     if st.button(f"Place: buy {qty} {side.upper()} @ {st.session_state['px']}¢ (post-only)", type="primary", width="stretch",
                  key="place"):
         flash(*feed.place(side, px, qty))

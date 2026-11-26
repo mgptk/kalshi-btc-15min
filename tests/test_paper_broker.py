@@ -314,3 +314,131 @@ def test_take_profit_mode_has_no_stop_loss():
     delta(b, "yes", 0.50, -100); delta(b, "yes", 0.49, -200)
     delta(b, "yes", 0.20, 10); br.on_book(b, 2)                  # bid collapses to 20
     assert not br.exiting and br.working("exit")[0].tag == "tp"
+
+
+# ---------------------------------------------------------------- market orders
+def test_taker_fee_formula():
+    br = PaperBroker()
+    assert br.taker_fee(D("0.50"), D(100)) == D("1.75")          # 0.07 * 100 * .5 * .5
+    assert br.taker_fee(D("0.52"), D(1)) == D("0.02")            # 0.017472 rounds up
+    br.set_fee_model("quadratic", 0.5)
+    assert br.taker_fee(D("0.50"), D(100)) == D("0.88")
+
+
+def test_market_buy_walks_asks_pays_taker_fee_and_has_no_exit(setup):
+    br, b = setup                                                 # YES asks 52 x100, 53 x50
+    ok, msg = br.market_order("yes", "buy", D(120), b, 0)
+    assert ok, msg
+    pos = br.position
+    # 100 @ 52 (fee 1.75) + 20 @ 53 (fee 0.07*20*.53*.47 = 0.34874 -> 0.35)
+    assert pos.qty == D(120) and pos.cost == D("52.00") + D("10.60") + D("1.75") + D("0.35")
+    assert br.cash == D(1000) - pos.cost
+    assert [(f.price, f.qty, f.fee) for f in br.fills] == [(D("0.52"), D(100), D("1.75")),
+                                                          (D("0.53"), D(20), D("0.35"))]
+    assert br.stop is None and not br.working() and not br.protected
+    delta(b, "yes", 0.50, -100); delta(b, "yes", 0.49, -200); delta(b, "yes", 0.10, 5)
+    br.on_book(b, 1)                                              # bid collapses: nothing triggers
+    assert not br.exiting and not br.working()
+
+
+def test_market_buy_take_profit_mode_still_unprotected():
+    br, b = _tp_broker()
+    assert br.market_order("yes", "buy", D(10), b, 0)[0]
+    assert not br.working("exit") and br.stop is None
+    br.set_trail(D(6), "cents", b, 1)                             # changing distance doesn't attach
+    assert not br.working("exit")
+
+
+def test_market_buy_partial_when_book_thin(setup):
+    br, b = setup
+    ok, msg = br.market_order("no", "buy", D(500), b, 0)          # NO asks: 50 x100, 51 x200
+    assert ok and "200 unfilled" in msg and br.position.qty == D(300)
+
+
+def test_market_buy_rejections(setup):
+    br, b = setup
+    assert not br.market_order("yes", "buy", D("1.5"), b, 0)[0]
+    assert br.market_order("yes", "buy", D(10), b, 0)[0]
+    br2 = PaperBroker(starting_cash=D(10)); br2.set_ticker(T)
+    ok, msg = br2.market_order("yes", "buy", D(100), b, 0)
+    assert not ok and "buying power" in msg
+    ok, msg = br.market_order("no", "buy", D(1), b, 0)            # holding YES
+    assert not ok and "hold YES" in msg
+    empty = book({0.50: 10}, {})
+    br3 = PaperBroker(); br3.set_ticker(T)
+    ok, msg = br3.market_order("yes", "buy", D(1), empty, 0)
+    assert not ok and "No YES asks" in msg
+
+
+def test_market_sell_hits_bids_and_realizes_pnl(setup):
+    br, b = setup
+    br.market_order("yes", "buy", D(10), b, 0)                    # 10 @ 52, fee 0.18
+    cost = br.position.cost
+    assert cost == D("5.38")
+    ok, msg = br.market_order("yes", "sell", D(4), b, 1)          # 4 @ 50 bid, fee 0.07
+    assert ok, msg
+    assert br.position.qty == D(6)
+    pnl = D("2.00") - D("0.07") - cost * D(4) / D(10)
+    assert br.realized == pnl
+    ok, _ = br.market_order("yes", "sell", D(6), b, 2)
+    assert ok and br.position is None and not br.protected
+
+
+def test_market_sell_rejections(setup):
+    br, b = setup
+    ok, msg = br.market_order("yes", "sell", D(1), b, 0)
+    assert not ok and "No YES position" in msg
+    br.market_order("yes", "buy", D(10), b, 0)
+    ok, msg = br.market_order("no", "sell", D(1), b, 1)
+    assert not ok and "No NO position" in msg
+    ok, msg = br.market_order("yes", "sell", D(11), b, 1)
+    assert not ok and "only hold 10" in msg
+
+
+def test_attach_exit_to_market_position_afterwards(setup):
+    br, b = setup
+    br.market_order("yes", "buy", D(10), b, 0)
+    assert br.exit_mode == "trailing" and br.stop is None
+    ok, msg = br.set_exit_mode("trailing", b, 1)                  # same mode: attaches the stop
+    assert ok and br.protected and br.stop.hwm == D("0.50") and br.stop.level == D("0.45")
+    ok, _ = br.set_exit_mode("take_profit", b, 2)
+    tp = br.working("exit")[0]
+    assert tp.tag == "tp" and tp.qty == D(10) and tp.price == br.tp_target()
+
+
+def test_market_buy_into_protected_position_resizes_take_profit():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)                       # limit fill -> TP for 10
+    assert br.working("exit")[0].qty == D(10)
+    br.market_order("yes", "buy", D(5), b, 2)
+    tp = br.working("exit")[0]
+    assert tp.qty == D(15) and tp.price == br.tp_target()
+
+
+def test_market_sell_resizes_or_cancels_exit_orders():
+    br, b = _tp_broker()
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(10)), b, 0)
+    br.on_trade(trade(0.49, 1, "no"), b, 1)
+    br.market_order("yes", "sell", D(4), b, 2)
+    assert br.working("exit")[0].qty == D(6)
+    br.market_order("yes", "sell", D(6), b, 3)
+    assert br.position is None and not br.working()
+
+
+def test_market_sell_during_chase_reprices_chase(setup):
+    br, b = setup
+    _filled_yes(br, b)
+    br.exit_now(b, 2)
+    assert br.working("exit")[0].qty == D(10)
+    br.market_order("yes", "sell", D(3), b, 3)
+    ex = br.working("exit")
+    assert len(ex) == 1 and ex[0].qty == D(7) and ex[0].tag == "chase"
+
+
+def test_limit_fill_after_market_buy_attaches_exit(setup):
+    br, b = setup
+    br.market_order("yes", "buy", D(5), b, 0)
+    br.submit(OrderIntent("yes", "buy", D("0.50"), D(5)), b, 1)
+    br.on_trade(trade(0.49, 1, "no"), b, 2)
+    assert br.position.qty == D(10) and br.protected and br.stop is not None
