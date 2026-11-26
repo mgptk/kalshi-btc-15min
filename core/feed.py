@@ -317,6 +317,10 @@ class FeedService:
         with self.lock:
             return self.broker.submit(OrderIntent(side, "buy", Decimal(price), Decimal(qty)), self.book, now_ms())
 
+    def market_order(self, side: str, action: str, qty: Decimal) -> tuple[bool, str]:
+        with self.lock:
+            return self.broker.market_order(side, action, Decimal(qty), self.book, now_ms())
+
     def cancel(self, order_id: int) -> tuple[bool, str]:
         with self.lock:
             return self.broker.cancel(order_id, now_ms())

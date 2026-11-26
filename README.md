@@ -2,7 +2,7 @@
 
 A phone-friendly Streamlit terminal for the current Kalshi **KXBTC15M** (BTC Up/Down, 15 min) window:
 live order book, CF Benchmarks **BRTI** + trailing 60 s average, the window target, and **paper trading**
-against the real book with post-only entries and automatic trailing-stop exits.
+against the real book with post-only entries, market orders, and automatic trailing-stop / take-profit exits.
 
 Full design: project doc `specs/v0-manual-paper-terminal.md`.
 
@@ -39,11 +39,15 @@ The app sleeps after 12 h without visits; opening it wakes it (paper account res
 - **Header**: time left · gap between the current 60 s average and the target (green = currently Up) ·
   YES/NO bid/ask · target · BRTI · in the final minute, the running settlement average and tick count (n/60).
 - **Ladder**: top 5 YES bids and YES asks (asks are derived from NO bids).
+- **Market buy / Market sell** (under the YES/NO toggle): buy or sell the number in **Contracts** of the selected
+  side right now, taking liquidity from the book and paying **taker fees**. Market orders never add a stop or
+  take-profit; the position card shows **NO STOP / TP** until you attach one from Exit Strategy.
 - **Ticket**: pick YES (Up) or NO (Down), price in cents, contracts. **Join bid** / **Bid + 1¢** fill the price
   from the live book. Orders are **post-only** — a price at or through the ask is rejected, so entries never pay
   taker fees. **Replace** cancels the working entry and re-places it (queue position resets).
 - **Exit Strategy** (expander): choose **Trailing stop** or **Take profit** with the buttons, then set the
-  distance in ¢ or % (default 5¢). The same distance drives whichever strategy is selected.
+  distance in ¢ or % (default 5¢). The same distance drives whichever strategy is selected. With a position that
+  has no exit (e.g. from a market buy), tapping either strategy — including the one already highlighted — attaches it.
 
 ### Paper-trading rules (summary)
 
@@ -58,7 +62,8 @@ The app sleeps after 12 h without visits; opening it wakes it (paper account res
 | On trigger | Cancels any unfilled entry, then posts a fee-free sell at best bid + 1 tick and re-posts every time the bid moves, until filled or the window closes |
 | Exit now | Starts the fee-free chase immediately (either strategy; cancels a resting take-profit) |
 | Close | Working orders cancelled; open position settles $1/$0 from the final-minute average vs target, then reconciled with Kalshi's official result |
-| Fees | Checked from the series `fee_type` at startup (currently `quadratic` = makers pay nothing) |
+| Market orders | Walk the book level by level at resting prices for the full quantity; any part the book can't fill is cancelled. Buys need enough buying power for the whole fill; sells can't exceed what you hold. A market buy into a flat position has no stop/TP; into a position that already has one, that exit keeps covering the whole position (a take-profit is resized). A market sell resizes a working take-profit/chase, or cancels it if you go flat |
+| Fees | Checked from the series `fee_type` at startup (currently `quadratic` = makers pay nothing). Market orders pay the taker fee: 7% × fee multiplier × contracts × P × (1 − P), rounded up to the cent per price level |
 | One side at a time | Can't buy NO while holding YES (or vice-versa) |
 
 Ticks: Kalshi uses 0.1¢ steps below 10¢ and above 90¢ and 1¢ in between; the exit chase follows that grid.

@@ -1,5 +1,6 @@
 """Paper broker: post-only resting orders, conservative queue-position fills,
-automatic trailing-stop exits with a fee-free chase, and settlement at close.
+market (taker) orders that walk the book and pay taker fees,
+automatic trailing-stop / take-profit exits with a fee-free chase, and settlement at close.
 
 All methods are called by FeedService while it holds its lock, so no locking here.
 """
@@ -24,6 +25,8 @@ from .trailing_stop import TrailingStop
 MIN_PRICE = TICK
 MAX_PRICE = ONE - TICK
 MAKER_RATE = Decimal("0.0175")
+TAKER_RATE = Decimal("0.07")
+CENT = Decimal("0.01")
 
 
 def _cents(x: Decimal | None) -> str:
@@ -51,7 +54,9 @@ class PaperBroker(Broker):
         self.trail_mode = trail_mode
         self.exit_mode = exit_mode               # "trailing" | "take_profit"
         self.exiting = False                     # fee-free exit chase running for the open position
+        self.protected = False                   # open position has an automatic exit (stop / take-profit)
         self.maker_fee_multiplier = Decimal(0)   # 0 => no maker fees (standard "quadratic" series)
+        self.taker_fee_multiplier = Decimal(1)   # series fee_multiplier applied to the taker rate
         self.ticker: str | None = None
         self.price_ranges = None                 # market's price grid; None -> tapered default
         self.orders: dict[int, Order] = {}
@@ -76,12 +81,18 @@ class PaperBroker(Broker):
             self.maker_fee_multiplier = Decimal(str(multiplier or 1))
         else:
             self.maker_fee_multiplier = Decimal(0)
+        self.taker_fee_multiplier = Decimal(str(multiplier)) if multiplier is not None else Decimal(1)
 
     def maker_fee(self, price: Decimal, qty: Decimal) -> Decimal:
         if self.maker_fee_multiplier == 0:
             return Decimal(0)
         raw = MAKER_RATE * self.maker_fee_multiplier * qty * price * (ONE - price)
-        return raw.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        return raw.quantize(CENT, rounding=ROUND_CEILING)
+
+    def taker_fee(self, price: Decimal, qty: Decimal) -> Decimal:
+        """Kalshi taker fee: 7% × multiplier × C × P × (1 − P), rounded up to the cent."""
+        raw = TAKER_RATE * self.taker_fee_multiplier * qty * price * (ONE - price)
+        return raw.quantize(CENT, rounding=ROUND_CEILING)
 
     @property
     def reserved(self) -> Decimal:
@@ -194,19 +205,23 @@ class PaperBroker(Broker):
         if mode not in ("trailing", "take_profit"):
             return False, f"Unknown exit strategy: {mode}"
         label = "Trailing stop" if mode == "trailing" else "Take profit"
-        if mode == self.exit_mode:
+        pos = self.position
+        has_pos = bool(pos and pos.qty > 0)
+        attach = has_pos and not self.protected and not self.exiting
+        if mode == self.exit_mode and not attach:
             return True, f"Exit strategy: {label}"
         self.exit_mode = mode
-        pos = self.position
         note = ""
-        if pos and pos.qty > 0:
+        if has_pos:
             if self.exiting:
                 note = " (applies to your next position — an exit is already working)"
             elif mode == "take_profit":
+                self.protected = True
                 self.stop = None
                 self._sync_tp(book, ts_ms)
                 note = " — take-profit order placed for the open position"
             else:
+                self.protected = True
                 for o in self.working("exit"):
                     self._cancel_order(o, ts_ms, "switched to trailing stop", quiet=True)
                 self.stop = TrailingStop(self.trail_value, self.trail_mode, book.best_bid(pos.side) or pos.avg_price)
@@ -223,6 +238,94 @@ class PaperBroker(Broker):
             self.stop.force_trigger()
         self._start_exit(book, ts_ms, "manual exit")
         return True, "Exit started (fee-free chase)."
+
+    def market_order(self, side: str, action: str, qty: Decimal, book: OrderBook, ts_ms: int) -> tuple[bool, str]:
+        """Take liquidity now: walk the opposite side of the book for `qty` contracts.
+
+        Fills level by level at the resting prices and pays the taker fee on each level.
+        Whatever the book can't fill is cancelled (immediate-or-cancel). A market buy never
+        attaches a stop or take-profit by itself; one can be added from the Exit Strategy
+        controls. If the position already has an exit, it keeps covering the whole position.
+        """
+        if side not in ("yes", "no") or action not in ("buy", "sell"):
+            return False, "Unknown market order."
+        if not self.ticker or not book.ready:
+            return False, "No live market/order book yet."
+        qty = Decimal(qty)
+        if qty <= 0 or qty != qty.to_integral_value():
+            return False, "Quantity must be a whole number of contracts."
+        pos = self.position
+        holding = pos is not None and pos.qty > 0 and pos.ticker == self.ticker
+        if action == "buy":
+            opp = "no" if side == "yes" else "yes"
+            if holding and pos.side == opp:
+                return False, f"You hold {opp.upper()} — close it before buying {side.upper()}."
+            if any(o.side == opp for o in self.working("entry")):
+                return False, f"Cancel your working {opp.upper()} entry first."
+            if self.exiting:
+                return False, "An exit is working on your position — wait for it to finish."
+            levels = book.ladder(depth=10_000, side=side)["asks"]
+        else:
+            if not holding or pos.side != side:
+                return False, f"No {side.upper()} position to sell."
+            if qty > pos.qty:
+                return False, f"You only hold {_qty(pos.qty)} {side.upper()}."
+            levels = book.ladder(depth=10_000, side=side)["bids"]
+
+        plan: list[tuple[Decimal, Decimal, Decimal]] = []   # (price, qty, fee)
+        left = qty
+        for px, size in levels:
+            if left <= 0:
+                break
+            take = min(left, size)
+            plan.append((px, take, self.taker_fee(px, take)))
+            left -= take
+        if not plan:
+            where = "asks" if action == "buy" else "bids"
+            return False, f"No {side.upper()} {where} in the book."
+        filled = qty - left
+        notional = sum((px * n for px, n, _ in plan), Decimal(0))
+        fees = sum((f for _, _, f in plan), Decimal(0))
+        if action == "buy" and notional + fees > self.available:
+            return False, (f"Not enough buying power (${self.available:.2f} available, "
+                           f"${notional + fees:.2f} needed).")
+
+        o = Order(self._next_id, self.ticker, side, action, plan[-1][0], filled,
+                  "entry" if action == "buy" else "exit", ts_ms, filled=filled, status="filled", tag="market")
+        self._next_id += 1
+        self.orders[o.id] = o
+        pnl = Decimal(0)
+        for px, n, fee in plan:
+            if action == "buy":
+                self._book_buy(o, px, n, fee, ts_ms)
+            else:
+                pnl += self._book_sell(o, px, n, fee, ts_ms)
+
+        vwap = notional / filled
+        short = f"; {_qty(left)} unfilled (book exhausted)" if left > 0 else ""
+        verb = "bought" if action == "buy" else "sold"
+        detail = (f"#{o.id} {verb} {_qty(filled)} {side.upper()} @ avg {_cents(vwap.quantize(Decimal('0.0001')))} "
+                  f"(worst {_cents(plan[-1][0])}, taker fee ${fees:.2f}){short}")
+        if action == "buy":
+            if self.protected and self.exit_mode == "take_profit":
+                self._sync_tp(book, ts_ms)
+            self._log(ts_ms, "market", f"{detail} → position {_qty(self.position.qty)}"
+                      + ("" if self.protected else " · no stop/TP"))
+        else:
+            self._log(ts_ms, "market", detail, pnl=pnl)
+            if self.position is None or self.position.qty <= 0:
+                for x in self.working("exit"):
+                    self._cancel_order(x, ts_ms, "position closed by market sell", quiet=True)
+                self._go_flat()
+                self._log(ts_ms, "flat", "Position closed")
+            elif self.exiting:
+                self._chase(book, ts_ms)
+            elif self.protected and self.exit_mode == "take_profit":
+                self._sync_tp(book, ts_ms)
+        msg = f"Market {action}: {verb} {_qty(filled)} {side.upper()} @ avg {_cents(vwap.quantize(Decimal('0.0001')))}, fee ${fees:.2f}"
+        if action == "sell":
+            msg += f", P&L {'+' if pnl >= 0 else '−'}${abs(pnl):.2f}"
+        return True, msg + short
 
     # ------------------------------------------------------------------ take profit
     def _grid_ceil(self, price: Decimal) -> Decimal:
@@ -248,7 +351,7 @@ class PaperBroker(Broker):
     def _sync_tp(self, book: OrderBook, ts: int) -> None:
         """Keep one resting post-only take-profit sell for the whole position at the target."""
         pos = self.position
-        if not pos or pos.qty <= 0 or self.exiting or self.exit_mode != "take_profit":
+        if not pos or pos.qty <= 0 or self.exiting or self.exit_mode != "take_profit" or not self.protected:
             return
         target = self.tp_target()
         px = target
@@ -320,14 +423,14 @@ class PaperBroker(Broker):
                 self._cancel_order(o, ts_ms, "window closed")
         if self.position and self.position.ticker == ticker and self.position.qty > 0:
             pos = self.position
-            self.position, self.stop, self.exiting = None, None, False
+            self._go_flat()
             if yes_won is None:
                 self.pending_settlement[ticker] = pos
                 self._log(ts_ms, "close", f"Window closed holding {_qty(pos.qty)} {pos.side.upper()} — awaiting result", ticker=ticker)
             else:
                 self._settle(ticker, pos, yes_won, ts_ms, "computed")
         elif self.position and self.position.ticker == ticker:
-            self.position, self.stop, self.exiting = None, None, False
+            self._go_flat()
 
     def reconcile(self, ticker: str, official_yes_won: bool, ts_ms: int) -> None:
         """Apply Kalshi's official result: settle pending positions or correct a computed one."""
@@ -346,38 +449,54 @@ class PaperBroker(Broker):
             rec["source"] = "official"
 
     # ------------------------------------------------------------------ internals
+    def _go_flat(self) -> None:
+        self.position, self.stop, self.exiting, self.protected = None, None, False, False
+
+    def _book_buy(self, o: Order, price: Decimal, qty: Decimal, fee: Decimal, ts: int) -> Decimal:
+        """Record a buy fill: cash out, position up. Returns the cost incl. fee."""
+        cost = price * qty + fee
+        self.fills.append(Fill(o.id, o.ticker, o.side, "buy", price, qty, fee, ts))
+        self.cash -= cost
+        if self.position is None or self.position.ticker != o.ticker:
+            self.position = Position(o.ticker, o.side)
+        self.position.qty += qty
+        self.position.cost += cost
+        return cost
+
+    def _book_sell(self, o: Order, price: Decimal, qty: Decimal, fee: Decimal, ts: int) -> Decimal:
+        """Record a sell fill against the position at average cost. Returns realized P&L."""
+        pos = self.position
+        self.fills.append(Fill(o.id, o.ticker, o.side, "sell", price, qty, fee, ts))
+        proceeds = price * qty - fee
+        basis = pos.cost * (qty / pos.qty) if pos and pos.qty > 0 else Decimal(0)
+        pnl = proceeds - basis
+        self.cash += proceeds
+        self.realized += pnl
+        if pos:
+            pos.qty -= qty
+            pos.cost -= basis
+        return pnl
+
     def _fill(self, o: Order, qty: Decimal, book: OrderBook, ts: int) -> None:
         if qty <= 0:
             return
         fee = self.maker_fee(o.price, qty)
         o.filled += qty
-        self.fills.append(Fill(o.id, o.ticker, o.side, o.action, o.price, qty, fee, ts))
         if o.action == "buy":
-            cost = o.price * qty + fee
-            self.cash -= cost
+            cost = self._book_buy(o, o.price, qty, fee, ts)
             o.reserved = max(Decimal(0), o.reserved - cost)
-            if self.position is None or self.position.ticker != o.ticker:
-                self.position = Position(o.ticker, o.side)
-            self.position.qty += qty
-            self.position.cost += cost
+            self.protected = True          # limit entries always get the selected exit strategy
             self._log(ts, "fill", f"#{o.id} bought {_qty(qty)} {o.side.upper()} @ {_cents(o.price)} → position {_qty(self.position.qty)}")
             if self.exit_mode == "take_profit":
                 self._sync_tp(book, ts)
             elif self.stop is None:
                 self.stop = TrailingStop(self.trail_value, self.trail_mode, book.best_bid(o.side) or o.price)
         else:
+            pnl = self._book_sell(o, o.price, qty, fee, ts)
             pos = self.position
-            proceeds = o.price * qty - fee
-            basis = pos.cost * (qty / pos.qty) if pos and pos.qty > 0 else Decimal(0)
-            pnl = proceeds - basis
-            self.cash += proceeds
-            self.realized += pnl
-            if pos:
-                pos.qty -= qty
-                pos.cost -= basis
             self._log(ts, "fill", f"#{o.id} sold {_qty(qty)} {o.side.upper()} @ {_cents(o.price)}", pnl=pnl)
             if pos and pos.qty <= 0:
-                self.position, self.stop, self.exiting = None, None, False
+                self._go_flat()
                 self._log(ts, "flat", "Position closed")
         if o.remaining <= 0:
             o.status = "filled"
@@ -453,6 +572,7 @@ class PaperBroker(Broker):
             "trail_mode": self.trail_mode,
             "exit_mode": self.exit_mode,
             "exiting": self.exiting,
+            "protected": self.protected,
             "tp_target": self.tp_target() if self.exit_mode == "take_profit" else None,
             "orders": [vars(o).copy() for o in self.working()],
             "log": [vars(e).copy() for e in reversed(self.log[-40:])],
